@@ -11,8 +11,16 @@ declare interface RetryOptions {
   count?: number;
   /** delay between retries - defaults to 3 */
   delay?: number;
-  strategy?: string | RetryHandlerFunction;
+  strategy?: string | RetryHandlerFunction | 'fixed' | 'exponential' | 'exponential-jitter';
   status?: number | number[];
+  /** multiplier for exponential backoff - defaults to 2 */
+  multiplier?: number;
+  /** maximum delay in ms - defaults to Infinity */
+  maxDelay?: number;
+  /** jitter type for exponential-jitter strategy - defaults to 'none' */
+  jitterType?: 'none' | 'full' | 'equal' | 'decorrelated';
+  /** seed for reproducible jitter - can be a string or number */
+  seed?: string | number;
 }
 
 declare interface BodyOptions {

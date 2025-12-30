@@ -19,7 +19,11 @@ const config = {
     },
     retry: {
       count: 1,
-      delay: 1000
+      delay: 1000,
+      strategy: 'fixed',
+      multiplier: 2,
+      maxDelay: Infinity,
+      jitterType: 'none'
     },
     disable_use_interaction: process.env.PACTUM_DISABLE_USE_INTERACTION || false,
   },

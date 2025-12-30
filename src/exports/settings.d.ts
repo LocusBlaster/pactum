@@ -55,4 +55,8 @@ export function setSnapshotDirectoryPath(path: string): void;
 export function setReporterAutoRun(auto: boolean): void;
 export function setRequestDefaultRetryCount(count: number): void;
 export function setRequestDefaultRetryDelay(delay: number): void;
+export function setRequestDefaultRetryStrategy(strategy: 'fixed' | 'exponential' | 'exponential-jitter'): void;
+export function setRequestDefaultRetryMultiplier(multiplier: number): void;
+export function setRequestDefaultRetryMaxDelay(maxDelay: number): void;
+export function setRequestDefaultRetryJitterType(jitterType: 'none' | 'full' | 'equal' | 'decorrelated'): void;
 export function setDataDirectory(path: string): void;

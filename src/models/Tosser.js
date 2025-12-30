@@ -11,6 +11,7 @@ const request = require('../exports/request');
 const config = require('../config');
 const hr = require('../helpers/handler.runner');
 const { pactumEvents, EVENT_TYPES } = require('../exports/events');
+const { calculateDelay } = require('../helpers/retryDelayCalculator');
 
 class Tosser {
 
@@ -85,13 +86,15 @@ class Tosser {
       const delay = typeof options.delay === 'number' ? options.delay : config.request.retry.delay;
       const strategy = options.strategy;
       const status = options.status;
+      const builtInStrategies = ['fixed', 'exponential', 'exponential-jitter'];
+      let prevDelay = delay;
       for (let i = 0; i < count; i++) {
         let err = null;
         let shouldRetry = false;
         const ctx = { req: this.request, res: this.response };
         if (typeof strategy === 'function') {
           shouldRetry = !strategy(ctx);
-        } else if (typeof strategy === 'string') {
+        } else if (typeof strategy === 'string' && !builtInStrategies.includes(strategy)) {
           shouldRetry = !hr.retry(strategy, ctx);
         } else if (status) {
           if (Array.isArray(status)) {
@@ -108,13 +111,27 @@ class Tosser {
           }
         }
         if (shouldRetry) {
-          const scale = delay === 1000 ? 'second' : 'seconds';
-          if (err) {
-            log.info(`Request retry initiated, waiting ${delay / 1000} ${scale} for attempt ${i + 1} of ${count} due to error: ${err.message}`);
-          } else {
-            log.info(`Request retry initiated, waiting ${delay / 1000} ${scale} for attempt ${i + 1} of ${count}`);
+          const useDelayCalculator = builtInStrategies.includes(strategy) || (strategy === undefined && (options.multiplier || options.maxDelay || options.jitterType || options.seed));
+          let currentDelay = delay;
+          if (useDelayCalculator) {
+            currentDelay = calculateDelay(i, {
+              delay: typeof options.delay === 'number' ? options.delay : undefined,
+              strategy: typeof options.strategy === 'string' ? options.strategy : undefined,
+              multiplier: options.multiplier,
+              maxDelay: options.maxDelay,
+              jitterType: options.jitterType,
+              seed: options.seed,
+              prevDelay: prevDelay
+            });
+            prevDelay = currentDelay;
           }
-          await helper.sleep(delay);
+          const scale = currentDelay === 1000 ? 'second' : 'seconds';
+          if (err) {
+            log.info(`Request retry initiated, waiting ${currentDelay / 1000} ${scale} for attempt ${i + 1} of ${count} due to error: ${err.message}`);
+          } else {
+            log.info(`Request retry initiated, waiting ${currentDelay / 1000} ${scale} for attempt ${i + 1} of ${count}`);
+          }
+          await helper.sleep(currentDelay);
           this.response = await getResponse(this);
           this.spec._response = this.response;
           await th.runResponseHandler(this.spec);
