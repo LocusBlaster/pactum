@@ -1,0 +1,285 @@
+diff --git a/src/config.js b/src/config.js
+index 3807013..9b6017a 100644
+--- a/src/config.js
++++ b/src/config.js
+@@ -19,7 +19,11 @@ const config = {
+     },
+     retry: {
+       count: 1,
+-      delay: 1000
++      delay: 1000,
++      strategy: 'fixed',
++      multiplier: 2,
++      maxDelay: Infinity,
++      jitterType: 'none'
+     },
+     disable_use_interaction: process.env.PACTUM_DISABLE_USE_INTERACTION || false,
+   },
+diff --git a/src/exports/settings.d.ts b/src/exports/settings.d.ts
+index 04e8b7e..2f19219 100644
+--- a/src/exports/settings.d.ts
++++ b/src/exports/settings.d.ts
+@@ -55,4 +55,8 @@ export function setSnapshotDirectoryPath(path: string): void;
+ export function setReporterAutoRun(auto: boolean): void;
+ export function setRequestDefaultRetryCount(count: number): void;
+ export function setRequestDefaultRetryDelay(delay: number): void;
++export function setRequestDefaultRetryStrategy(strategy: 'fixed' | 'exponential' | 'exponential-jitter'): void;
++export function setRequestDefaultRetryMultiplier(multiplier: number): void;
++export function setRequestDefaultRetryMaxDelay(maxDelay: number): void;
++export function setRequestDefaultRetryJitterType(jitterType: 'none' | 'full' | 'equal' | 'decorrelated'): void;
+ export function setDataDirectory(path: string): void;
+\ No newline at end of file
+diff --git a/src/exports/settings.js b/src/exports/settings.js
+index 1c0e24e..dfd8ad9 100644
+--- a/src/exports/settings.js
++++ b/src/exports/settings.js
+@@ -4,6 +4,7 @@ const jsonLike = require('../plugins/json.like');
+ const jsonMatch = require('../plugins/json.match');
+ const jsonSchema = require('../plugins/json.schema');
+ const fd = require('../plugins/form.data');
++const { PactumConfigurationError } = require('../helpers/errors');
+ 
+ const settings = {
+ 
+@@ -59,6 +60,36 @@ const settings = {
+     config.request.retry.delay = delay;
+   },
+ 
++  setRequestDefaultRetryStrategy(strategy) {
++    const validStrategies = ['fixed', 'exponential', 'exponential-jitter'];
++    if (!validStrategies.includes(strategy)) {
++      throw new PactumConfigurationError(`Invalid retry strategy: ${strategy}. Must be one of: ${validStrategies.join(', ')}`);
++    }
++    config.request.retry.strategy = strategy;
++  },
++
++  setRequestDefaultRetryMultiplier(multiplier) {
++    if (typeof multiplier !== 'number' || multiplier <= 0) {
++      throw new PactumConfigurationError(`Multiplier must be a positive number, received: ${multiplier}`);
++    }
++    config.request.retry.multiplier = multiplier;
++  },
++
++  setRequestDefaultRetryMaxDelay(maxDelay) {
++    if (typeof maxDelay !== 'number' || maxDelay < config.request.retry.delay) {
++      throw new PactumConfigurationError(`Max delay must be a number greater than or equal to base delay (${config.request.retry.delay}), received: ${maxDelay}`);
++    }
++    config.request.retry.maxDelay = maxDelay;
++  },
++
++  setRequestDefaultRetryJitterType(jitterType) {
++    const validJitterTypes = ['none', 'full', 'equal', 'decorrelated'];
++    if (!validJitterTypes.includes(jitterType)) {
++      throw new PactumConfigurationError(`Invalid jitter type: ${jitterType}. Must be one of: ${validJitterTypes.join(', ')}`);
++    }
++    config.request.retry.jitterType = jitterType;
++  },
++
+   setDataDirectory(path) {
+     config.data.dir = path;
+   }
+diff --git a/src/helpers/retryDelayCalculator.js b/src/helpers/retryDelayCalculator.js
+new file mode 100644
+index 0000000..e1b3f56
+--- /dev/null
++++ b/src/helpers/retryDelayCalculator.js
+@@ -0,0 +1,114 @@
++const { PactumRequestError } = require('./errors');
++
++function getSeedFromString(str) {
++  if (typeof str !== 'string') {
++    throw new PactumRequestError(`Seed must be a string, received: ${typeof str}`);
++  }
++  let hash = 0;
++  for (let i = 0; i < str.length; i++) {
++    const char = str.charCodeAt(i);
++    hash = ((hash << 5) - hash) + char;
++    hash = hash & hash;
++  }
++  return Math.abs(hash);
++}
++
++class SeededRandom {
++  constructor(seed = 0) {
++    if (typeof seed === 'string') {
++      this.seed = getSeedFromString(seed);
++    } else {
++      this.seed = seed;
++    }
++  }
++
++  next() {
++    this.seed = (this.seed * 9301 + 49297) % 233280;
++    return this.seed / 233280;
++  }
++
++  range(min, max) {
++    return Math.floor(this.next() * (max - min)) + min;
++  }
++}
++
++function calculateDelay(attempt, options = {}) {
++  if (typeof attempt !== 'number' || attempt < 0) {
++    throw new PactumRequestError(`Attempt must be a non-negative number, received: ${attempt}`);
++  }
++
++  const config = require('../config');
++  const baseDelay = options.delay != null ? options.delay : config.request.retry.delay;
++  const strategy = options.strategy || config.request.retry.strategy || 'fixed';
++  const multiplier = options.multiplier != null ? options.multiplier : config.request.retry.multiplier || 2;
++  const maxDelay = options.maxDelay != null ? options.maxDelay : config.request.retry.maxDelay || Infinity;
++  const jitterType = options.jitterType || config.request.retry.jitterType || 'none';
++  const seed = options.seed != null ? options.seed : null;
++  const prevDelay = options.prevDelay != null ? options.prevDelay : baseDelay;
++
++  if (typeof baseDelay !== 'number' || baseDelay < 0) {
++    throw new PactumRequestError(`Base delay must be a non-negative number, received: ${baseDelay}`);
++  }
++  if (typeof multiplier !== 'number' || multiplier <= 0) {
++    throw new PactumRequestError(`Multiplier must be a positive number, received: ${multiplier}`);
++  }
++  if (typeof maxDelay !== 'number' || maxDelay < 0) {
++    throw new PactumRequestError(`Max delay must be a non-negative number, received: ${maxDelay}`);
++  }
++
++  let delay;
++
++  switch (strategy) {
++    case 'fixed':
++      delay = baseDelay;
++      break;
++    case 'exponential':
++      delay = baseDelay * Math.pow(multiplier, attempt);
++      break;
++    case 'exponential-jitter': {
++      const exponentialDelay = baseDelay * Math.pow(multiplier, attempt);
++      delay = applyJitter(exponentialDelay, jitterType, baseDelay, prevDelay, seed, attempt);
++      break;
++    }
++    default:
++      throw new PactumRequestError(`Invalid retry strategy: ${strategy}. Must be one of: 'fixed', 'exponential', 'exponential-jitter'`);
++  }
++
++  delay = Math.floor(delay);
++  if (maxDelay !== Infinity) {
++    delay = Math.min(delay, maxDelay);
++  }
++  delay = Math.max(delay, 0);
++
++  return delay;
++}
++
++function applyJitter(baseDelay, jitterType, initialBaseDelay, prevDelay, seed, attempt) {
++  let effectiveSeed = seed != null ? seed : Math.floor(Math.random() * 2147483647);
++  if (typeof effectiveSeed === 'string') {
++    effectiveSeed = getSeedFromString(effectiveSeed);
++  }
++  const rng = new SeededRandom(effectiveSeed + attempt);
++
++  switch (jitterType) {
++    case 'full':
++      return rng.range(0, Math.ceil(baseDelay));
++    case 'equal': {
++      const minEqualDelay = initialBaseDelay / 2;
++      return rng.range(Math.floor(minEqualDelay), Math.ceil(baseDelay));
++    }
++    case 'decorrelated': {
++      const minDecorrelated = initialBaseDelay;
++      const maxDecorrelated = prevDelay * 3;
++      return rng.range(minDecorrelated, Math.ceil(maxDecorrelated));
++    }
++    case 'none':
++      return baseDelay;
++    default:
++      throw new PactumRequestError(`Invalid jitter type: ${jitterType}. Must be one of: 'none', 'full', 'equal', 'decorrelated'`);
++  }
++}
++
++module.exports = {
++  calculateDelay,
++  SeededRandom,
++  getSeedFromString
++};
+diff --git a/src/models/Spec.d.ts b/src/models/Spec.d.ts
+index 139f53d..3a79f2f 100644
+--- a/src/models/Spec.d.ts
++++ b/src/models/Spec.d.ts
+@@ -11,8 +11,16 @@ declare interface RetryOptions {
+   count?: number;
+   /** delay between retries - defaults to 3 */
+   delay?: number;
+-  strategy?: string | RetryHandlerFunction;
++  strategy?: string | RetryHandlerFunction | 'fixed' | 'exponential' | 'exponential-jitter';
+   status?: number | number[];
++  /** multiplier for exponential backoff - defaults to 2 */
++  multiplier?: number;
++  /** maximum delay in ms - defaults to Infinity */
++  maxDelay?: number;
++  /** jitter type for exponential-jitter strategy - defaults to 'none' */
++  jitterType?: 'none' | 'full' | 'equal' | 'decorrelated';
++  /** seed for reproducible jitter - can be a string or number */
++  seed?: string | number;
+ }
+ 
+ declare interface BodyOptions {
+diff --git a/src/models/Tosser.js b/src/models/Tosser.js
+index 9d34d46..136e109 100644
+--- a/src/models/Tosser.js
++++ b/src/models/Tosser.js
+@@ -11,6 +11,7 @@ const request = require('../exports/request');
+ const config = require('../config');
+ const hr = require('../helpers/handler.runner');
+ const { pactumEvents, EVENT_TYPES } = require('../exports/events');
++const { calculateDelay } = require('../helpers/retryDelayCalculator');
+ 
+ class Tosser {
+ 
+@@ -85,13 +86,15 @@ class Tosser {
+       const delay = typeof options.delay === 'number' ? options.delay : config.request.retry.delay;
+       const strategy = options.strategy;
+       const status = options.status;
++      const builtInStrategies = ['fixed', 'exponential', 'exponential-jitter'];
++      let prevDelay = delay;
+       for (let i = 0; i < count; i++) {
+         let err = null;
+         let shouldRetry = false;
+         const ctx = { req: this.request, res: this.response };
+         if (typeof strategy === 'function') {
+           shouldRetry = !strategy(ctx);
+-        } else if (typeof strategy === 'string') {
++        } else if (typeof strategy === 'string' && !builtInStrategies.includes(strategy)) {
+           shouldRetry = !hr.retry(strategy, ctx);
+         } else if (status) {
+           if (Array.isArray(status)) {
+@@ -108,13 +111,27 @@ class Tosser {
+           }
+         }
+         if (shouldRetry) {
+-          const scale = delay === 1000 ? 'second' : 'seconds';
++          const useDelayCalculator = builtInStrategies.includes(strategy) || (strategy === undefined && (options.multiplier || options.maxDelay || options.jitterType || options.seed));
++          let currentDelay = delay;
++          if (useDelayCalculator) {
++            currentDelay = calculateDelay(i, {
++              delay: typeof options.delay === 'number' ? options.delay : undefined,
++              strategy: typeof options.strategy === 'string' ? options.strategy : undefined,
++              multiplier: options.multiplier,
++              maxDelay: options.maxDelay,
++              jitterType: options.jitterType,
++              seed: options.seed,
++              prevDelay: prevDelay
++            });
++            prevDelay = currentDelay;
++          }
++          const scale = currentDelay === 1000 ? 'second' : 'seconds';
+           if (err) {
+-            log.info(`Request retry initiated, waiting ${delay / 1000} ${scale} for attempt ${i + 1} of ${count} due to error: ${err.message}`);
++            log.info(`Request retry initiated, waiting ${currentDelay / 1000} ${scale} for attempt ${i + 1} of ${count} due to error: ${err.message}`);
+           } else {
+-            log.info(`Request retry initiated, waiting ${delay / 1000} ${scale} for attempt ${i + 1} of ${count}`);
++            log.info(`Request retry initiated, waiting ${currentDelay / 1000} ${scale} for attempt ${i + 1} of ${count}`);
+           }
+-          await helper.sleep(delay);
++          await helper.sleep(currentDelay);
+           this.response = await getResponse(this);
+           this.spec._response = this.response;
+           await th.runResponseHandler(this.spec);
