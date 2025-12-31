@@ -2,9 +2,9 @@ const fs = require('fs');
 const path = require('path');
 const config = require('../config');
 
-const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-const ISO_DATE_REGEX = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$/;
-const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const UUID_REGEX = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi;
+const ISO_DATE_REGEX = /\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})/g;
+const EMAIL_REGEX = /[^\s@]+@[^\s@]+\.[^\s@]+/g;
 
 const recorder = {
   mode: null,
@@ -71,7 +71,7 @@ const recorder = {
     if (this.mode === 'PLAYBACK') {
       const match = this.findMatch(sanitizedRequest);
       if (match) {
-        return match.response;
+        return this.reconstructResponse(match.response);
       }
       throw new Error('No recording found');
     }
@@ -90,7 +90,7 @@ const recorder = {
     if (this.mode === 'AUTO') {
       const match = this.findMatch(sanitizedRequest);
       if (match) {
-        return match.response;
+        return this.reconstructResponse(match.response);
       }
       const response = await next();
       const sanitizedResponse = this.sanitize(this.extractResponseData(response));
@@ -116,14 +116,27 @@ const recorder = {
   },
 
   extractResponseData(response) {
-    const data = {
+    return {
       statusCode: response.statusCode,
       headers: response.headers || {},
       body: response.body
     };
-    if (response.json) data.json = response.json;
-    if (response.text) data.text = response.text;
-    return data;
+  },
+
+  reconstructResponse(recordedResponse) {
+    const res = { ...recordedResponse };
+    if (typeof res.body === 'object' && res.body !== null) {
+      res.json = res.body;
+      res.text = JSON.stringify(res.body);
+    } else {
+      res.text = res.body || '';
+      try {
+        res.json = JSON.parse(res.text);
+      } catch (e) {
+        // not json
+      }
+    }
+    return res;
   },
 
   sanitize(data) {
@@ -132,33 +145,45 @@ const recorder = {
   },
 
   _sanitizeRecursive(data, customSanitizers) {
+    let sanitized = data;
+
     if (typeof data === 'string') {
-      if (UUID_REGEX.test(data)) return '<UUID>';
-      if (ISO_DATE_REGEX.test(data)) return '<ISO_TIMESTAMP>';
-      if (EMAIL_REGEX.test(data)) return '<EMAIL>';
-      return data;
-    }
-    if (Array.isArray(data)) {
-      return data.map(item => this._sanitizeRecursive(item, customSanitizers));
-    }
-    if (data !== null && typeof data === 'object') {
-      const sanitized = {};
-      for (const key in data) {
+      sanitized = data.replace(UUID_REGEX, '<UUID>')
+                      .replace(ISO_DATE_REGEX, '<ISO_TIMESTAMP>')
+                      .replace(EMAIL_REGEX, '<EMAIL>');
+    } else if (Array.isArray(data)) {
+      sanitized = data.map(item => this._sanitizeRecursive(item, customSanitizers));
+    } else if (data !== null && typeof data === 'object') {
+      sanitized = {};
+      const keys = Object.keys(data);
+      for (const key of keys) {
         const lowerKey = key.toLowerCase();
         if (lowerKey === 'authorization' && typeof data[key] === 'string' && data[key].toLowerCase().startsWith('bearer ')) {
           sanitized[key] = 'Bearer <TOKEN>';
-        } else if (lowerKey === 'x-api-key' || lowerKey === 'api-key') {
-          sanitized[key] = '<API_KEY>';
+        } else if (
+          lowerKey.includes('key') || 
+          lowerKey.includes('token') || 
+          lowerKey.includes('secret') || 
+          lowerKey.includes('auth') || 
+          lowerKey.includes('password')
+        ) {
+          sanitized[key] = '<REDACTED>';
         } else {
           sanitized[key] = this._sanitizeRecursive(data[key], customSanitizers);
         }
       }
-      for (const sanitizer of customSanitizers) {
-        sanitizer(sanitized);
-      }
-      return sanitized;
     }
-    return data;
+
+    if (customSanitizers && customSanitizers.length > 0) {
+      for (const sanitizer of customSanitizers) {
+        const result = sanitizer(sanitized);
+        if (result !== undefined) {
+          sanitized = result;
+        }
+      }
+    }
+
+    return sanitized;
   },
 
   findMatch(request) {
