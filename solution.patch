@@ -1,0 +1,332 @@
+diff --git a/src/config.js b/src/config.js
+index 3807013..a3e2a1e 100644
+--- a/src/config.js
++++ b/src/config.js
+@@ -19,7 +19,11 @@ const config = {
+     },
+     retry: {
+       count: 1,
+-      delay: 1000
++      delay: 1000,
++      strategy: 'fixed',
++      multiplier: 2,
++      maxDelay: 30000,
++      jitterType: 'full'
+     },
+     disable_use_interaction: process.env.PACTUM_DISABLE_USE_INTERACTION || false,
+   },
+diff --git a/src/exports/settings.js b/src/exports/settings.js
+index 1c0e24e..7b651db 100644
+--- a/src/exports/settings.js
++++ b/src/exports/settings.js
+@@ -56,9 +56,57 @@ const settings = {
+   },
+ 
+   setRequestDefaultRetryDelay(delay) {
++    if (typeof delay !== 'number' || !Number.isFinite(delay) || delay < 0) {
++      throw new Error('Retry delay must be a non-negative finite number');
++    }
++    if (config.request.retry.maxDelay !== undefined && delay > config.request.retry.maxDelay) {
++      throw new Error(`Retry delay (${delay}) cannot exceed max delay (${config.request.retry.maxDelay})`);
++    }
+     config.request.retry.delay = delay;
+   },
+ 
++  setRequestDefaultRetryStrategy(strategy) {
++    const validStrategies = ['fixed', 'exponential', 'exponential-jitter'];
++    if (typeof strategy !== 'string') {
++      throw new Error('Retry strategy must be a string');
++    }
++    if (!validStrategies.includes(strategy)) {
++      throw new Error(`Invalid retry strategy: ${strategy}. Must be one of: ${validStrategies.join(', ')}`);
++    }
++    config.request.retry.strategy = strategy;
++  },
++
++  setRequestDefaultRetryMultiplier(multiplier) {
++    if (typeof multiplier !== 'number' || !Number.isFinite(multiplier) || multiplier <= 0) {
++      throw new Error('Retry multiplier must be a positive finite number');
++    }
++    if (multiplier < 1) {
++      throw new Error('Retry multiplier must be >= 1 for exponential growth');
++    }
++    config.request.retry.multiplier = multiplier;
++  },
++
++  setRequestDefaultRetryMaxDelay(maxDelay) {
++    if (typeof maxDelay !== 'number' || !Number.isFinite(maxDelay) || maxDelay <= 0) {
++      throw new Error('Retry max delay must be a positive finite number');
++    }
++    if (maxDelay < config.request.retry.delay) {
++      throw new Error(`Retry max delay (${maxDelay}) cannot be less than base delay (${config.request.retry.delay})`);
++    }
++    config.request.retry.maxDelay = maxDelay;
++  },
++
++  setRequestDefaultRetryJitterType(jitterType) {
++    const validJitterTypes = ['full', 'equal', 'decorrelated'];
++    if (typeof jitterType !== 'string') {
++      throw new Error('Jitter type must be a string');
++    }
++    if (!validJitterTypes.includes(jitterType)) {
++      throw new Error(`Invalid jitter type: ${jitterType}. Must be one of: ${validJitterTypes.join(', ')}`);
++    }
++    config.request.retry.jitterType = jitterType;
++  },
++
+   setDataDirectory(path) {
+     config.data.dir = path;
+   }
+diff --git a/src/helpers/retryDelayCalculator.js b/src/helpers/retryDelayCalculator.js
+new file mode 100644
+index 0000000..c61851a
+--- /dev/null
++++ b/src/helpers/retryDelayCalculator.js
+@@ -0,0 +1,200 @@
++const config = require('../config');
++
++/**
++ * SeededRandom - Linear Congruential Generator for deterministic randomness
++ * Uses parameters from Numerical Recipes (Knuth's MMIX)
++ */
++class SeededRandom {
++  constructor(seed) {
++    this.seed = normalizeSeed(seed);
++    this.m = 0x80000000; // 2^31
++    this.a = 1103515245;
++    this.c = 12345;
++    this.state = this.seed;
++  }
++
++  /**
++   * Returns next random float in range [0, 1)
++   */
++  next() {
++    this.state = ((this.a * this.state) >>> 0) + this.c;
++    this.state = this.state >>> 0;
++    this.state = this.state % this.m;
++    return this.state / (this.m - 1);
++  }
++
++  /**
++   * Returns random integer in range [min, max)
++   */
++  range(min, max) {
++    if (min >= max) {
++      throw new Error('min must be less than max');
++    }
++    const randomFloat = this.next();
++    return Math.floor(min + randomFloat * (max - min));
++  }
++}
++
++/**
++ * Normalize seed to ensure it's a valid 32-bit unsigned integer
++ */
++function normalizeSeed(seed) {
++  if (typeof seed === 'number') {
++    if (!Number.isFinite(seed)) {
++      throw new Error('Seed must be a finite number');
++    }
++    return Math.abs(Math.floor(seed)) >>> 0;
++  }
++  if (typeof seed === 'string') {
++    return getSeedFromString(seed);
++  }
++  throw new Error('Seed must be a number or string');
++}
++
++/**
++ * Convert string to numeric seed using FNV-1a hash algorithm
++ */
++function getSeedFromString(str) {
++  if (typeof str !== 'string') {
++    throw new Error('Seed must be a string');
++  }
++
++  let hash = 2166136261;
++  for (let i = 0; i < str.length; i++) {
++    hash ^= str.charCodeAt(i);
++    hash = Math.imul(hash, 16777619);
++  }
++
++  return (hash >>> 0);
++}
++
++/**
++ * Calculate retry delay based on strategy and options
++ * @param {number} attempt - Current attempt number (0-based)
++ * @param {object} options - Retry options
++ * @param {number} prevDelay - Previous delay (for decorrelated jitter)
++ * @returns {number} Delay in milliseconds (integer)
++ */
++function calculateDelay(attempt, options = {}, prevDelay = null) {
++  if (typeof attempt !== 'number' || attempt < 0 || !Number.isInteger(attempt)) {
++    throw new Error('Attempt must be a non-negative integer');
++  }
++
++  const baseDelay = typeof options.delay === 'number'
++    ? options.delay
++    : config.request.retry.delay;
++
++  const strategy = options.strategy || config.request.retry.strategy || 'fixed';
++  const multiplier = typeof options.multiplier === 'number'
++    ? options.multiplier
++    : (config.request.retry.multiplier !== undefined ? config.request.retry.multiplier : 2);
++
++  const maxDelay = typeof options.maxDelay === 'number'
++    ? options.maxDelay
++    : (config.request.retry.maxDelay !== undefined ? config.request.retry.maxDelay : 30000);
++
++  const jitterType = options.jitterType || config.request.retry.jitterType || 'full';
++
++  if (baseDelay < 0) {
++    throw new Error('Base delay must be non-negative');
++  }
++
++  if (baseDelay === 0) {
++    return 0;
++  }
++
++  if (multiplier <= 0) {
++    throw new Error('Multiplier must be positive');
++  }
++
++  if (maxDelay < baseDelay) {
++    throw new Error('Max delay cannot be less than base delay');
++  }
++
++  let delay;
++
++  switch (strategy) {
++    case 'fixed':
++      delay = baseDelay;
++      break;
++
++    case 'exponential':
++      delay = calculateExponentialDelay(attempt, baseDelay, multiplier, maxDelay);
++      break;
++
++    case 'exponential-jitter':
++      delay = calculateExponentialJitterDelay(
++        attempt,
++        baseDelay,
++        multiplier,
++        maxDelay,
++        jitterType,
++        options.seed,
++        prevDelay
++      );
++      break;
++
++    default:
++      throw new Error(`Unknown retry strategy: ${strategy}`);
++  }
++
++  return Math.floor(delay);
++}
++
++/**
++ * Calculate exponential backoff delay
++ */
++function calculateExponentialDelay(attempt, baseDelay, multiplier, maxDelay) {
++  const expDelay = baseDelay * Math.pow(multiplier, attempt);
++  return Math.min(expDelay, maxDelay);
++}
++
++/**
++ * Calculate exponential backoff with jitter
++ */
++function calculateExponentialJitterDelay(attempt, baseDelay, multiplier, maxDelay, jitterType, seed, prevDelay) {
++  const expDelay = calculateExponentialDelay(attempt, baseDelay, multiplier, maxDelay);
++
++  let random;
++  if (seed !== undefined && seed !== null) {
++    const numericSeed = typeof seed === 'string' ? getSeedFromString(seed) : (typeof seed === 'number' ? normalizeSeed(seed) : seed);
++    const attemptSeed = (numericSeed + attempt * 2654435761) >>> 0;
++    const rng = new SeededRandom(attemptSeed);
++    random = rng.next();
++  } else {
++    random = Math.random();
++  }
++
++  let delay;
++
++  switch (jitterType) {
++    case 'full':
++      delay = random * expDelay;
++      break;
++
++    case 'equal':
++      delay = expDelay / 2 + random * (expDelay / 2);
++      break;
++
++    case 'decorrelated':
++      if (prevDelay === null || prevDelay === undefined || attempt === 0) {
++        delay = random * baseDelay;
++      } else {
++        const cappedPrevDelay = Math.min(prevDelay, maxDelay);
++        const tempDelay = baseDelay + random * (cappedPrevDelay * multiplier - baseDelay);
++        delay = Math.min(Math.max(tempDelay, baseDelay), maxDelay);
++      }
++      break;
++
++    default:
++      throw new Error(`Unknown jitter type: ${jitterType}`);
++  }
++
++  return Math.min(delay, maxDelay);
++}
++
++module.exports = {
++  calculateDelay,
++  SeededRandom,
++  getSeedFromString
++};
+diff --git a/src/models/Tosser.js b/src/models/Tosser.js
+index 9d34d46..60e0a6b 100644
+--- a/src/models/Tosser.js
++++ b/src/models/Tosser.js
+@@ -11,6 +11,7 @@ const request = require('../exports/request');
+ const config = require('../config');
+ const hr = require('../helpers/handler.runner');
+ const { pactumEvents, EVENT_TYPES } = require('../exports/events');
++const { calculateDelay } = require('../helpers/retryDelayCalculator');
+ 
+ class Tosser {
+ 
+@@ -82,16 +83,18 @@ class Tosser {
+     const options = this.request.retryOptions;
+     if (options) {
+       const count = typeof options.count === 'number' ? options.count : config.request.retry.count;
+-      const delay = typeof options.delay === 'number' ? options.delay : config.request.retry.delay;
+       const strategy = options.strategy;
+       const status = options.status;
++      const isDelayStrategy = typeof strategy === 'string' && ['fixed', 'exponential', 'exponential-jitter'].includes(strategy);
++      const useDelayCalculator = isDelayStrategy || (!strategy && !status);
++      let prevDelay = null;
+       for (let i = 0; i < count; i++) {
+         let err = null;
+         let shouldRetry = false;
+         const ctx = { req: this.request, res: this.response };
+         if (typeof strategy === 'function') {
+           shouldRetry = !strategy(ctx);
+-        } else if (typeof strategy === 'string') {
++        } else if (typeof strategy === 'string' && !isDelayStrategy) {
+           shouldRetry = !hr.retry(strategy, ctx);
+         } else if (status) {
+           if (Array.isArray(status)) {
+@@ -108,6 +111,13 @@ class Tosser {
+           }
+         }
+         if (shouldRetry) {
++          let delay;
++          if (useDelayCalculator) {
++            delay = calculateDelay(i, options, prevDelay);
++            prevDelay = delay;
++          } else {
++            delay = typeof options.delay === 'number' ? options.delay : config.request.retry.delay;
++          }
+           const scale = delay === 1000 ? 'second' : 'seconds';
+           if (err) {
+             log.info(`Request retry initiated, waiting ${delay / 1000} ${scale} for attempt ${i + 1} of ${count} due to error: ${err.message}`);

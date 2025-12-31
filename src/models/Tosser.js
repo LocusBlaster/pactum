@@ -11,6 +11,7 @@ const request = require('../exports/request');
 const config = require('../config');
 const hr = require('../helpers/handler.runner');
 const { pactumEvents, EVENT_TYPES } = require('../exports/events');
+const { calculateDelay } = require('../helpers/retryDelayCalculator');
 
 class Tosser {
 
@@ -82,16 +83,18 @@ class Tosser {
     const options = this.request.retryOptions;
     if (options) {
       const count = typeof options.count === 'number' ? options.count : config.request.retry.count;
-      const delay = typeof options.delay === 'number' ? options.delay : config.request.retry.delay;
       const strategy = options.strategy;
       const status = options.status;
+      const isDelayStrategy = typeof strategy === 'string' && ['fixed', 'exponential', 'exponential-jitter'].includes(strategy);
+      const useDelayCalculator = isDelayStrategy || (!strategy && !status);
+      let prevDelay = null;
       for (let i = 0; i < count; i++) {
         let err = null;
         let shouldRetry = false;
         const ctx = { req: this.request, res: this.response };
         if (typeof strategy === 'function') {
           shouldRetry = !strategy(ctx);
-        } else if (typeof strategy === 'string') {
+        } else if (typeof strategy === 'string' && !isDelayStrategy) {
           shouldRetry = !hr.retry(strategy, ctx);
         } else if (status) {
           if (Array.isArray(status)) {
@@ -108,6 +111,13 @@ class Tosser {
           }
         }
         if (shouldRetry) {
+          let delay;
+          if (useDelayCalculator) {
+            delay = calculateDelay(i, options, prevDelay);
+            prevDelay = delay;
+          } else {
+            delay = typeof options.delay === 'number' ? options.delay : config.request.retry.delay;
+          }
           const scale = delay === 1000 ? 'second' : 'seconds';
           if (err) {
             log.info(`Request retry initiated, waiting ${delay / 1000} ${scale} for attempt ${i + 1} of ${count} due to error: ${err.message}`);
