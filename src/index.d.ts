@@ -8,6 +8,7 @@ export { expect };
 export * as events from './exports/events';
 export * as handler from './exports/handler';
 export * as mock from './exports/mock';
+export * as recorder from './exports/recorder';
 export * as reporter from './exports/reporter';
 export * as request from './exports/request';
 export * as response from './exports/response';

@@ -3,6 +3,7 @@ const fs = require('fs');
 const helper = require('../helpers/helper');
 const log = require('../plugins/logger');
 const rlc = require('../helpers/reporter.lifeCycle');
+const recorder = require('../helpers/recorder');
 const requestProcessor = require('../helpers/requestProcessor');
 const th = require('../helpers/toss.helper');
 const utils = require('../helpers/utils');
@@ -306,14 +307,17 @@ async function getResponse(tosser) {
   try {
     pactumEvents.emit(EVENT_TYPES.BEFORE_REQUEST, { request });
     log.debug(`${request.method} ${request.url}`);
-    res = await phinx(request);
-    res.buffer = res.body;
-    res.text = helper.bufferToString(res.body) || '';
-    res.body = helper.bufferToString(res.body);
-    res.json = helper.getJson(res.body);
-    if (helper.isContentJson(res)) {
-      res.body = res.json;
-    }
+    res = await recorder.handle(request, async () => {
+      const response = await phinx(request);
+      response.buffer = response.body;
+      response.text = helper.bufferToString(response.body) || '';
+      response.body = helper.bufferToString(response.body);
+      response.json = helper.getJson(response.body);
+      if (helper.isContentJson(response)) {
+        response.body = response.json;
+      }
+      return response;
+    });
   } catch (error) {
     if (expect.errors.length === 0) {
       log.error('Error performing request', error);

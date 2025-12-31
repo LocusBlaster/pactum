@@ -56,3 +56,6 @@ export function setReporterAutoRun(auto: boolean): void;
 export function setRequestDefaultRetryCount(count: number): void;
 export function setRequestDefaultRetryDelay(delay: number): void;
 export function setDataDirectory(path: string): void;
+export function setRecordingDirectory(path: string): void;
+export function setRecordingMatchThreshold(threshold: number): void;
+export function addRecordingSanitizer(sanitizerFn: (data: any) => void): void;
