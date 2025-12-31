@@ -61,6 +61,18 @@ const settings = {
 
   setDataDirectory(path) {
     config.data.dir = path;
+  },
+
+  setRecordingDirectory(path) {
+    config.recorder.dir = path;
+  },
+
+  setRecordingMatchThreshold(threshold) {
+    config.recorder.threshold = threshold;
+  },
+
+  addRecordingSanitizer(sanitizerFn) {
+    config.recorder.sanitizers.push(sanitizerFn);
   }
 
 };

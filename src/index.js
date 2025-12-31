@@ -19,6 +19,7 @@ const state = require('./exports/state');
 const stash = require('./exports/stash');
 const expect = require('./exports/expect');
 const reporter = require('./exports/reporter');
+const recorder = require('./exports/recorder');
 const events = require('./exports/events');
 const utils = require('./exports/utils');
 
@@ -41,6 +42,7 @@ const pactum = {
   stash,
   expect,
   reporter,
+  recorder,
   events,
   utils,
 

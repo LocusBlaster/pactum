@@ -71,6 +71,11 @@ const config = {
   snapshot: {
     dir: '.pactum/snapshots'
   },
+  recorder: {
+    dir: '.pactum/recordings',
+    threshold: 1,
+    sanitizers: []
+  },
   reporter : {
     autoRun: true
   }
